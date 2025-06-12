@@ -2,10 +2,10 @@ name: Module
 
 on:
   push:
-    branches:
-      - master
-    paths-ignore:
-      - '**/README.md'
+    branches: [master]
+    paths-ignore: ['**/README.md']
+  workflow_dispatch: # 添加此行启用手动触发
+
 jobs:
   build:
     runs-on: ubuntu-20.04
