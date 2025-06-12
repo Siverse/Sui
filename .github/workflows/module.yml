@@ -4,7 +4,6 @@ on:
   push:
     branches: [master]
     paths-ignore: ['**/README.md']
-  # 添加手动触发支持 [1,6,7](@ref)
   workflow_dispatch:
     inputs:
       build_type:
@@ -14,19 +13,30 @@ on:
 
 jobs:
   build:
-    # 升级至 Ubuntu 24.04 LTS（避免 20.04 于 2025.04 淘汰）[6](@ref)
     runs-on: ubuntu-24.04
-    # 支持手动触发参数过滤 [7](@ref)
     if: |
       (!startsWith(github.event.head_commit.message, '[skip ci]')) ||
       (github.event_name == 'workflow_dispatch')
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4  # 升级至最新版
+        uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+
+      # 关键修复：安装指定版本 CMake
+      - name: Install CMake 3.10.2
+        run: |
+          # 移除系统预装版本避免冲突
+          sudo apt-get remove -y cmake
+          # 下载并安装指定版本
+          wget https://cmake.org/files/v3.10/cmake-3.10.2-Linux-x86_64.sh
+          sudo sh cmake-3.10.2-Linux-x86_64.sh --skip-license --prefix=/usr/local
+          # 验证安装
+          cmake --version
+          # 添加到系统路径
+          echo "/usr/local/bin" >> $GITHUB_PATH
 
       - name: Setup Java
         uses: actions/setup-java@v3
@@ -35,7 +45,6 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      # 合并缓存步骤（移除冗余 v2 缓存）[8](@ref)
       - name: Cache Gradle Dependencies
         uses: actions/cache@v3
         with:
@@ -52,11 +61,9 @@ jobs:
           ccache -o max_size=2G
           ccache -o hash_dir=false
 
-      # 动态构建命令（支持手动触发参数）[7](@ref)
       - name: Build with Gradle
         run: |
           ./gradlew clean
-          # 根据参数选择构建任务
           case "${{ github.event.inputs.build_type }}" in
             debug)
               ./gradlew zipRiruDebug zipZygiskDebug
@@ -73,16 +80,60 @@ jobs:
         if: success()
         id: prepareArtifact
         run: |
-          # 简化输出命名逻辑（避免空目录报错）
-          [[ -f out/sui-riru-*-release.zip ]] && \
-            riruReleaseName=$(basename out/sui-riru-*-release.zip .zip) && \
-            unzip -qo out/sui-riru-*-release.zip -d sui-riru-release
-          ...（其他类似处理）
+          # 安全处理每种构建类型
+          handle_artifact() {
+            local pattern=$1
+            local output_var=$2
+            local dir=$3
+            
+            if compgen -G "$pattern" > /dev/null; then
+              filename=$(ls $pattern | head -1)
+              name=$(basename "$filename" .zip)
+              unzip -qo "$filename" -d "$dir"
+              echo "$output_var=$name" >> $GITHUB_OUTPUT
+            else
+              echo "$output_var=" >> $GITHUB_OUTPUT
+            fi
+          }
 
-      # 动态上传步骤（仅生成文件时上传）[2](@ref)
+          handle_artifact "out/sui-riru-*-release.zip" "riruReleaseName" "sui-riru-release"
+          handle_artifact "out/sui-riru-*-debug.zip" "riruDebugName" "sui-riru-debug"
+          handle_artifact "out/sui-zygisk-*-release.zip" "zygiskReleaseName" "sui-zygisk-release"
+          handle_artifact "out/sui-zygisk-*-debug.zip" "zygiskDebugName" "sui-zygisk-debug"
+
       - name: Upload Riru release
         if: ${{ steps.prepareArtifact.outputs.riruReleaseName != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.prepareArtifact.outputs.riruReleaseName }}
           path: sui-riru-release/*
+
+      - name: Upload Riru debug
+        if: ${{ steps.prepareArtifact.outputs.riruDebugName != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.riruDebugName }}
+          path: sui-riru-debug/*
+
+      - name: Upload Zygisk release
+        if: ${{ steps.prepareArtifact.outputs.zygiskReleaseName != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.zygiskReleaseName }}
+          path: sui-zygisk-release/*
+
+      - name: Upload Zygisk debug
+        if: ${{ steps.prepareArtifact.outputs.zygiskDebugName != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.zygiskDebugName }}
+          path: sui-zygisk-debug/*
+
+      - name: Upload mappings
+        if: success() && (steps.prepareArtifact.outputs.riruReleaseName != '' || steps.prepareArtifact.outputs.zygiskReleaseName != '')
+        uses: actions/upload-artifact@v4
+        with:
+          name: mappings
+          path: |
+            module/build/outputs/mapping/release
+            ui/build/outputs/mapping/release
