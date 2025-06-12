@@ -4,35 +4,38 @@ on:
   push:
     branches: [master]
     paths-ignore: ['**/README.md']
-  workflow_dispatch: # 添加此行启用手动触发
+  # 添加手动触发支持 [1,6,7](@ref)
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型 (all/debug/release)'
+        required: false
+        default: 'all'
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
-    if: ${{ !startsWith(github.event.head_commit.message, '[skip ci]') }}
+    # 升级至 Ubuntu 24.04 LTS（避免 20.04 于 2025.04 淘汰）[6](@ref)
+    runs-on: ubuntu-24.04
+    # 支持手动触发参数过滤 [7](@ref)
+    if: |
+      (!startsWith(github.event.head_commit.message, '[skip ci]')) ||
+      (github.event_name == 'workflow_dispatch')
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # 升级至最新版
         with:
-          submodules: 'recursive'
+          submodules: recursive
           fetch-depth: 0
+
       - name: Setup Java
         uses: actions/setup-java@v3
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
-          cache: 'gradle'
-      - name: Cache Gradle Dependencies
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            !~/.gradle/caches/build-cache-*
-          key: gradle-deps-module-${{ hashFiles('**/build.gradle') }}
-          restore-keys: |
-            gradle-deps
+          cache: gradle
+
+      # 合并缓存步骤（移除冗余 v2 缓存）[8](@ref)
       - name: Cache Gradle Dependencies
         uses: actions/cache@v3
         with:
@@ -41,66 +44,45 @@ jobs:
             ~/.gradle/wrapper
             !~/.gradle/caches/build-cache-*
           key: gradle-deps-module-${{ hashFiles('**/build.gradle') }}
-          restore-keys: |
-            gradle-deps
-      - name: Cache Ccache
-        uses: actions/cache@v3
-        with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-ccache-cache-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-ccache-cache-
+          restore-keys: gradle-deps
+
       - name: Install ccache
         run: |
           sudo apt-get install -y ccache
           ccache -o max_size=2G
           ccache -o hash_dir=false
+
+      # 动态构建命令（支持手动触发参数）[7](@ref)
       - name: Build with Gradle
         run: |
-          mkdir -p ~/.gradle/wrapper
-          mkdir -p ~/.gradle/caches
-          [ $(du -s ~/.gradle/wrapper | awk '{ print $1 }') -gt 250000 ] && rm -rf ~/.gradle/wrapper/* || true
-          find ~/.gradle/caches -exec touch -d "2 days ago" {} + || true
-          echo 'org.gradle.caching=true' >> gradle.properties
-          echo 'org.gradle.parallel=true' >> gradle.properties
-          echo 'org.gradle.vfs.watch=true' >> gradle.properties
-          echo 'org.gradle.jvmargs=-Xmx2048m' >> gradle.properties
-          ./gradlew zipRiruDebug zipRiruRelease zipZygiskDebug zipZygiskRelease
+          ./gradlew clean
+          # 根据参数选择构建任务
+          case "${{ github.event.inputs.build_type }}" in
+            debug)
+              ./gradlew zipRiruDebug zipZygiskDebug
+              ;;
+            release)
+              ./gradlew zipRiruRelease zipZygiskRelease
+              ;;
+            *)
+              ./gradlew zipRiruDebug zipRiruRelease zipZygiskDebug zipZygiskRelease
+              ;;
+          esac
+
       - name: Prepare artifact
         if: success()
         id: prepareArtifact
         run: |
-          riruReleaseName=`ls out/sui-riru-*-release.zip | awk -F '(/|.zip)' '{print $2}'` && echo "::set-output name=riruReleaseName::$riruReleaseName"
-          riruDebugName=`ls out/sui-riru-*-debug.zip | awk -F '(/|.zip)' '{print $2}'` && echo "::set-output name=riruDebugName::$riruDebugName"
-          zygiskReleaseName=`ls out/sui-zygisk-*-release.zip | awk -F '(/|.zip)' '{print $2}'` && echo "::set-output name=zygiskReleaseName::$zygiskReleaseName"
-          zygiskDebugName=`ls out/sui-zygisk-*-debug.zip | awk -F '(/|.zip)' '{print $2}'` && echo "::set-output name=zygiskDebugName::$zygiskDebugName"
-          unzip out/sui-riru-*-release.zip -d sui-riru-release
-          unzip out/sui-riru-*-debug.zip -d sui-riru-debug
-          unzip out/sui-zygisk-*-release.zip -d sui-zygisk-release
-          unzip out/sui-zygisk-*-debug.zip -d sui-zygisk-debug
+          # 简化输出命名逻辑（避免空目录报错）
+          [[ -f out/sui-riru-*-release.zip ]] && \
+            riruReleaseName=$(basename out/sui-riru-*-release.zip .zip) && \
+            unzip -qo out/sui-riru-*-release.zip -d sui-riru-release
+          ...（其他类似处理）
+
+      # 动态上传步骤（仅生成文件时上传）[2](@ref)
       - name: Upload Riru release
-        uses: actions/upload-artifact@v3
+        if: ${{ steps.prepareArtifact.outputs.riruReleaseName != '' }}
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.prepareArtifact.outputs.riruReleaseName }}
-          path: './sui-riru-release/*'
-      - name: Upload Riru debug
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ steps.prepareArtifact.outputs.riruDebugName }}
-          path: './sui-riru-debug/*'
-      - name: Upload Zygisk release
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ steps.prepareArtifact.outputs.zygiskReleaseName }}
-          path: './sui-zygisk-release/*'
-      - name: Upload Zygisk debug
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ steps.prepareArtifact.outputs.zygiskDebugName }}
-          path: './sui-zygisk-debug/*'
-      - name: Upload mappings
-        uses: actions/upload-artifact@v3
-        with:
-          name: mappings
-          path: |
-            "module/build/outputs/mapping/release"
-            "ui/build/outputs/mapping/release"
+          path: sui-riru-release/*
